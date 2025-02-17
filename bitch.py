@@ -58,13 +58,12 @@ class MLP(nn.Module):
         self.down_proj = bnb_Linear4bit(m, hd, dtype = dtype)
         self.act_fn = ACT2FN["silu"]
     def forward(self, x):
-        print(self.up_proj.weight)
-        print(unsloth_dequantize(self.up_proj))
+        print('ho true god\n', unsloth_dequantize(self.up_proj))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 def mlp_forward(X, mlp, fx):
     up   = X @ fx(mlp.  up_proj).t()
-    print("ha\n", fx(mlp.  up_proj).t())
+    print("ha\n", fx(mlp.  up_proj))
     gate = X @ fx(mlp.gate_proj).t()
     h = mlp.act_fn(gate) * up
     down = h @ fx(mlp.down_proj).t()
@@ -106,72 +105,75 @@ def test_dequantize(dequantize_fx):
         elapsed += time.time() - start
     return elapsed
 
-lookup_table = [0.07958029955, 0.1609302014, 0.2461123019, 0.3379152417, 0.4407098293, 0.5626170039, 0.7229568362, 1.0]
+lookup_table = [-1.0, -0.6961928009986877, -0.5250730514526367, 0.0, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.07958029955, 0.1609302014, 0.2461123019, 0.3379152417, 0.4407098293, 0.5626170039, 0.7229568362, 1.0]
 lookup = torch.tensor(lookup_table).cuda()
 
 @triton.jit
 def _your_dequantize_nf4_kernel(
+    code: tl.tensor,
     a_ptr: tl.tensor,
-    absmax_ptr: tl.tensor,
+    absmax_ptr: tl.tensor,  # compressed absmax
+    absmax2_ptr: tl.tensor, # absmax of the absmax
     out_ptr: tl.tensor,
     blocksize: tl.constexpr,
     n_elements: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr, # processes 2 * TILE_SIZE elements
+    absmax_blocksize: tl.constexpr,
+    absmax_nelems: tl.constexpr,
+    absmax_offset: tl.constexpr,
     lookup_ptr: tl.tensor,
 ):
-    pdb.set_trace()
+    # pdb.set_trace()
     pid_m = tl.program_id(0)
     base_idx = pid_m * TILE_SIZE
 
     base_offsets = base_idx + tl.arange(0, TILE_SIZE)
 
-    absmax_offsets = base_offsets // blocksize
-    local_abs_max = tl.load(absmax_ptr + absmax_offsets)
+    local_abs_max = tl.load(absmax2_ptr + base_offsets // absmax_blocksize)
+    absmax_bytes = tl.load(absmax_ptr + base_offsets // blocksize, mask=base_offsets < absmax_nelems, other=0.0)
+    local_abs_max = tl.load(code + absmax_bytes) * local_abs_max + absmax_offset
 
-    qvals_bytes = tl.load(a_ptr + base_offsets, mask=base_offsets < n_elements // 2, other=0.0)
+    qvals_bytes = tl.load(a_ptr + base_offsets, mask=base_offsets < n_elements // 2) # other=0.0?
 
-    signs = tl.where((qvals_bytes & (1 << 3)) != 0, -1.0, 1.0)
-    signs2 = tl.where((qvals_bytes & (1 << 7)) != 0, -1.0, 1.0)
-
-    first_nibble  = qvals_bytes & 0b0111
-    second_nibble = (qvals_bytes >> 4) & 0b0111
-
+    first_nibble  = qvals_bytes & 0b1111
+    second_nibble = (qvals_bytes >> 4) & 0b1111
+    
     # NOTE: tl.gather is not released yet
 
     # lookup = tl.load(lookup_ptr + tl.arange(0, 8))
-    val0 = signs * tl.load(lookup_ptr + first_nibble) * local_abs_max
-    val1 = signs2 * tl.load(lookup_ptr + second_nibble) * local_abs_max
+    # BUG: they shouldn't have the same local_abs_max
+    val0 = tl.load(lookup_ptr + first_nibble) * local_abs_max
+    val1 = tl.load(lookup_ptr + second_nibble) * local_abs_max
 
     even_offsets = base_offsets * 2
     odd_offsets = even_offsets + 1
 
-    tl.store(out_ptr + even_offsets, val0.to(tl.bfloat16), mask=even_offsets < n_elements)
-    tl.store(out_ptr + odd_offsets, val1.to(tl.bfloat16), mask=odd_offsets < n_elements)
-
-def clz(x):
-    n = 32
-    for i in range(n):
-        if (x >> (n - 1 - i)) & 1:
-            return i
-    return n
+    tl.store(out_ptr + even_offsets, val0.to(tl.float16), mask=even_offsets < n_elements)
+    tl.store(out_ptr + odd_offsets, val1.to(tl.float16), mask=odd_offsets < n_elements)
 
 def _your_dequantize_nf4(weight, quant_state):
     n_elements = weight.numel()
-    TILE_SIZE = 128
+    TILE_SIZE = 128 # TILE_SIZE 1024 0.7751903380575093
 
-    output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device).cuda()
+    output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device, requires_grad = False).cuda()
 
     grid = (triton.cdiv(n_elements, TILE_SIZE),)
     _your_dequantize_nf4_kernel[grid](
+        quant_state.state2.code,
         weight,
         quant_state.absmax,
+        quant_state.state2.absmax,
         output,
         quant_state.blocksize,
         n_elements,
         TILE_SIZE,
+        quant_state.state2.blocksize,
+        quant_state.state2.absmax.numel(),
+        quant_state.offset.item(),
         lookup,
     )
-    return output
+
+    return output.t() if weight.shape[0] == 1 else output
 
 def your_dequantize_nf4(weight):
     return _your_dequantize_nf4(weight.weight.data, weight.weight.quant_state)
