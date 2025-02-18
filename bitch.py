@@ -78,6 +78,8 @@ def test_dequantize(dequantize_fx):
     options = [
         # (5,  777, 128,  128, 3409, torch.bfloat16),
         (5,  777, 128,  128, 3409, torch.float16),
+        (5,  777, 128,  128, 3408, torch.bfloat16),
+        (5,  777, 128,  128, 3408, torch.float32),
         # (3, 2048, 4096, 14336, 3408, torch.bfloat16),
         # (2, 3333, 2048,  8192, 3407, torch.float16),
     ]
@@ -96,12 +98,13 @@ def test_dequantize(dequantize_fx):
             print(a)
             print(A)
             assert_same(a, A, _F(_C()), dt)
-            return 1.0
+            break
             # assert_same(b, B, _F(_C()), dt)
             # assert_same(c, C, _F(_C()), dt)
 
         # Benchmarking
         torch.cuda.synchronize()
+        continue
         start = time.time()
         for _ in range(1000): mlp_dequantize(X, mlp, dequantize_fx)
         elapsed += time.time() - start
@@ -131,7 +134,7 @@ def _your_dequantize_nf4_kernel(
     base_offsets = base_idx + tl.arange(0, TILE_SIZE)
 
     absmax = tl.load(absmax2_ptr + base_offsets // absmax_blocksize)
-    absmax_bytes = tl.load(absmax_ptr + base_offsets // blocksize, mask=base_offsets // blocksize < absmax_nelems, other=0)
+    absmax_bytes = tl.load(absmax_ptr + 255 - base_offsets // blocksize, mask=base_offsets // blocksize < absmax_nelems, other=0)
     local_abs_max = tl.load(code + absmax_bytes) * absmax + absmax_offset
 
     qvals_bytes = tl.load(a_ptr + base_offsets, mask=base_offsets < n_elements // 2, other=0)
@@ -159,7 +162,7 @@ def _your_dequantize_nf4(weight, quant_state):
 
     grid = (triton.cdiv(n_elements // 2, TILE_SIZE),)
     _your_dequantize_nf4_kernel[grid](
-        quant_state.state2.code,
+        quant_state.state2.code.to(output.dtype),
         weight,
         quant_state.absmax,
         quant_state.state2.absmax,
@@ -170,7 +173,7 @@ def _your_dequantize_nf4(weight, quant_state):
         quant_state.state2.blocksize,
         quant_state.absmax.numel(),
         quant_state.offset.item(),
-        lookup, #.to(output.dtype),
+        lookup.to(output.dtype),
     )
 
     return output.t() if weight.shape[0] == 1 else output
