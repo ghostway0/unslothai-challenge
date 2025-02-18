@@ -157,7 +157,7 @@ def _your_dequantize_nf4(weight, quant_state):
 
     output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device, requires_grad = False).cuda()
 
-    grid = (triton.cdiv(n_elements // 2, TILE_SIZE),)
+    grid = (triton.cdiv(n_elements, TILE_SIZE * 2),)
     _your_dequantize_nf4_kernel[grid](
         quant_state.state2.code,
         weight,
