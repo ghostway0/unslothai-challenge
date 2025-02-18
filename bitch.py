@@ -69,15 +69,15 @@ def mlp_forward(X, mlp, fx):
 
 def mlp_dequantize(X, mlp, fx):
     a = fx(mlp.  up_proj).t(); torch.cuda.synchronize()
-    # b = fx(mlp.gate_proj).t(); torch.cuda.synchronize()
-    # c = fx(mlp.down_proj).t(); torch.cuda.synchronize()
-    return a, None, None #b, c
+    b = fx(mlp.gate_proj).t(); torch.cuda.synchronize()
+    c = fx(mlp.down_proj).t(); torch.cuda.synchronize()
+    return a, b, c
 
 def test_dequantize(dequantize_fx):
     elapsed = 0
     options = [
         (5,  777, 128,  128, 3409, torch.bfloat16),
-        # (3, 2048, 4096, 14336, 3408, torch.bfloat16),
+        (3, 2048, 4096, 14336, 3408, torch.bfloat16),
         # (2, 3333, 2048,  8192, 3407, torch.float16),
     ]
     for (bsz, qlen, hd, m, seed, dt) in options:
@@ -95,8 +95,8 @@ def test_dequantize(dequantize_fx):
             A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
             print(A)
             assert_same(a, A, _F(_C()), dt)
-            # assert_same(b, B, _F(_C()), dt)
-            # assert_same(c, C, _F(_C()), dt)
+            assert_same(b, B, _F(_C()), dt)
+            assert_same(c, C, _F(_C()), dt)
 
         # Benchmarking
         torch.cuda.synchronize()
@@ -148,8 +148,8 @@ def _your_dequantize_nf4_kernel(
     even_offsets = base_offsets * 2
     odd_offsets = even_offsets + 1
 
-    tl.store(out_ptr + even_offsets, val0.to(tl.float16), mask=even_offsets < n_elements)
-    tl.store(out_ptr + odd_offsets, val1.to(tl.float16), mask=odd_offsets < n_elements)
+    tl.store(out_ptr + odd_offsets, val0.to(tl.bfloat16), mask=even_offsets < n_elements)
+    tl.store(out_ptr + even_offsets, val1.to(tl.bfloat16), mask=odd_offsets < n_elements)
 
 def _your_dequantize_nf4(weight, quant_state):
     n_elements = weight.numel() * 2
@@ -157,7 +157,7 @@ def _your_dequantize_nf4(weight, quant_state):
 
     output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device, requires_grad = False).cuda()
 
-    grid = (triton.cdiv(n_elements, TILE_SIZE * 2),)
+    grid = (triton.cdiv(n_elements // 2, TILE_SIZE),)
     _your_dequantize_nf4_kernel[grid](
         quant_state.state2.code,
         weight,
