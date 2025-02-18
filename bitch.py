@@ -68,6 +68,9 @@ def mlp_forward(X, mlp, fx):
     return down
 
 def mlp_dequantize(X, mlp, fx):
+    mlp.up_proj.weight.quant_state.state2.code = mlp.up_proj.weight.quant_state.state2.code.to(torch.float32)
+    mlp.gate_proj.weight.quant_state.state2.code = mlp.gate_proj.weight.quant_state.state2.code.to(torch.float32)
+    mlp.down_proj.weight.quant_state.state2.code = mlp.down_proj.weight.quant_state.state2.code.to(torch.float32)
     a = fx(mlp.  up_proj).t(); torch.cuda.synchronize()
     b = fx(mlp.gate_proj).t(); torch.cuda.synchronize()
     c = fx(mlp.down_proj).t(); torch.cuda.synchronize()
@@ -134,7 +137,7 @@ def _your_dequantize_nf4_kernel(
     base_offsets = base_idx + tl.arange(0, TILE_SIZE)
 
     absmax = tl.load(absmax2_ptr + base_offsets // absmax_blocksize)
-    absmax_bytes = tl.load(absmax_ptr + 255 - base_offsets // blocksize, mask=base_offsets // blocksize < absmax_nelems, other=0)
+    absmax_bytes = tl.load(absmax_ptr + base_offsets // blocksize, mask=base_offsets // blocksize < absmax_nelems, other=0)
     local_abs_max = tl.load(code + absmax_bytes) * absmax + absmax_offset
 
     qvals_bytes = tl.load(a_ptr + base_offsets, mask=base_offsets < n_elements // 2, other=0)
@@ -142,9 +145,6 @@ def _your_dequantize_nf4_kernel(
     first_nibble  = qvals_bytes & 0b1111
     second_nibble = (qvals_bytes >> 4) & 0b1111
 
-    # NOTE: tl.gather is not released yet
-
-    # lookup = tl.load(lookup_ptr + tl.arange(0, 8))
     val0 = tl.load(lookup_ptr + first_nibble) * local_abs_max
     val1 = tl.load(lookup_ptr + second_nibble) * local_abs_max
 
