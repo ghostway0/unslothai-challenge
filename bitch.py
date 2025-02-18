@@ -93,18 +93,19 @@ def test_dequantize(dequantize_fx):
             # assert_same( mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
             a, b, c = mlp_dequantize(X, mlp, dequantize_fx)
             A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
+            print(a)
+            print(A)
             assert_same(a, A, _F(_C()), dt)
+            return 1.0
             # assert_same(b, B, _F(_C()), dt)
             # assert_same(c, C, _F(_C()), dt)
-            break
-        continue
 
         # Benchmarking
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(1000): mlp_dequantize(X, mlp, dequantize_fx)
         elapsed += time.time() - start
-    return 1.0 #elapsed
+    return elapsed
 
 lookup_table = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0]
 lookup = torch.tensor(lookup_table).cuda()
@@ -141,15 +142,14 @@ def _your_dequantize_nf4_kernel(
     # NOTE: tl.gather is not released yet
 
     # lookup = tl.load(lookup_ptr + tl.arange(0, 8))
-    # BUG: they shouldn't have the same local_abs_max
     val0 = tl.load(lookup_ptr + first_nibble) * local_abs_max
     val1 = tl.load(lookup_ptr + second_nibble) * local_abs_max
 
     even_offsets = base_offsets * 2
     odd_offsets = even_offsets + 1
 
-    tl.store(out_ptr + odd_offsets, val0, mask=even_offsets < n_elements)
-    tl.store(out_ptr + even_offsets, val1, mask=odd_offsets < n_elements)
+    tl.store(out_ptr + odd_offsets, val0, mask=odd_offsets < n_elements)
+    tl.store(out_ptr + even_offsets, val1, mask=even_offsets < n_elements)
 
 def _your_dequantize_nf4(weight, quant_state):
     n_elements = weight.numel() * 2
@@ -159,7 +159,7 @@ def _your_dequantize_nf4(weight, quant_state):
 
     grid = (triton.cdiv(n_elements // 2, TILE_SIZE),)
     _your_dequantize_nf4_kernel[grid](
-        quant_state.state2.code.to(output.dtype),
+        quant_state.state2.code,
         weight,
         quant_state.absmax,
         quant_state.state2.absmax,
@@ -170,7 +170,7 @@ def _your_dequantize_nf4(weight, quant_state):
         quant_state.state2.blocksize,
         quant_state.absmax.numel(),
         quant_state.offset.item(),
-        lookup.to(output.dtype),
+        lookup, #.to(output.dtype),
     )
 
     return output.t() if weight.shape[0] == 1 else output
