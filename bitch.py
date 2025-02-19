@@ -1,4 +1,5 @@
 import torch
+import bitsandbytes.functional as F
 import inspect
 
 from transformers import set_seed
@@ -22,6 +23,8 @@ from inspect import currentframe as _C, getframeinfo
 _F = lambda c: getframeinfo(c).lineno # Gets line number
 WARN = lambda x: print(f"\033[31m{x}\033[0m") # Red colored warnings
 
+bnbdeq = lambda w: F.dequantize_nf4(w.weight, w.weight.quant_state)
+
 # https://stackoverflow.com/questions/18425225/getting-the-name-of-a-variable-as-a-string
 def NAME(var):
     callers_local_vars = inspect.currentframe().f_back.f_locals.items()
@@ -32,7 +35,9 @@ def assert_same(x, y, line=0, dtype=None):
     assert(dtype is None or x.dtype == dtype)
     try: torch.testing.assert_close(x, y, check_stride = True)
     except Exception as error:
-        raise Exception(
+        print(f"{x=}")
+        print(f"{y=}")
+        print(
             f"Failed allclose: {NAME(x)}, {NAME(y)}\n{str(error)}"
         )
 
@@ -41,7 +46,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 def unsloth_dequantize(weight):
     return fast_dequantize(weight.weight, weight.weight.quant_state)
 
-def bnb_Linear4bit(hd, m, dtype = torch.float16):
+def bnb_Linear4bit(hd, m, dtype):
     return Linear4bit(
         hd, m, bias = None,
         compute_dtype       = dtype,
@@ -58,12 +63,11 @@ class MLP(nn.Module):
         self.gate_proj.weight.quant_state.dtype = dtype
         self.up_proj  .weight.quant_state.dtype = dtype
         self.down_proj.weight.quant_state.dtype = dtype
-        self.up_proj.weight.quant_state.state2.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
-        self.gate_proj.weight.quant_state.state2.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
-        self.down_proj.weight.quant_state.state2.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
+        # self.up_proj.weight.quant_state.state2.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
+        # self.gate_proj.weight.quant_state.state2.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
+        # self.down_proj.weight.quant_state.state2.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
         self.act_fn = ACT2FN["silu"]
     def forward(self, x):
-        print(self.up_proj(x))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 def mlp_forward(X, mlp, fx):
@@ -79,31 +83,47 @@ def mlp_dequantize(X, mlp, fx):
     c = fx(mlp.down_proj).t(); torch.cuda.synchronize()
     return a, b, c
 
-def test_dequantize(dequantize_fx):
-    print(f"test_dequantize {dequantize_fx.__name__}")
-    elapsed = 0
-    options = [
+def assert_correct_bnb(weight, dtype):
+    assert(weight.weight.dtype == torch.uint8)
+    assert(weight.weight.quant_state.dtype == dtype)
+    assert(weight.weight.quant_state.absmax.dtype == torch.uint8)
+    assert(weight.weight.quant_state.code.dtype == torch.float32)
+    assert(weight.weight.quant_state.offset.dtype == torch.float32)
+    assert(weight.weight.quant_state.blocksize == 64)
+    assert(weight.weight.quant_state.state2.absmax.dtype == torch.float32)
+    assert(weight.weight.quant_state.state2.code.dtype == torch.float32)
+    assert(weight.weight.quant_state.state2.blocksize == 256)
+
         # (5,  777, 128,  128, 3409, torch.bfloat16),
         # (5,  777, 128,  128, 3409, torch.float16),
-        (5,  777, 128,  128, 3409, torch.float16),
         # (5,  777, 5, 128, 3408, torch.float16),
         # (5,  777, 128,  128, 3408, torch.float32),
-        # (3, 2048, 14336, 14336, 3408, torch.bfloat16),
-        # (2, 3333, 2048,  8192, 3407, torch.float16),
+def test_dequantize(dequantize_fx):
+    print(f"testing {dequantize_fx.__name__}")
+    elapsed = 0
+    options = [
+        # (5,  777, 128,  4, 3409, torch.bfloat16),
+        # (5,  777, 128,  4, 3409, torch.float16),
+        (3, 2048, 14336, 14336, 3408, torch.bfloat16),
+        (3, 2048, 14336, 14336, 3408, torch.float16),
+        (2, 3333, 2048,  8192, 3407, torch.float16),
     ]
     for i, (bsz, qlen, hd, m, seed, dt) in enumerate(options):
         print(options[i])
         set_seed(seed)
         torch.set_default_dtype(torch.float32)
         mlp = MLP(hd = hd, m = m, dtype = dt).to("cuda")
+        assert_correct_bnb(mlp.up_proj, dt)
+        assert_correct_bnb(mlp.gate_proj, dt)
+        assert_correct_bnb(mlp.down_proj, dt)
         X = torch.randn((bsz, qlen, hd), device = "cuda", dtype = dt)
         torch.cuda.synchronize()
 
         # Warmup
         for _ in range(2):
-            assert_same( mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
             a, b, c = mlp_dequantize(X, mlp, dequantize_fx)
-            A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
+            # A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
+            A, B, C = mlp_dequantize(X, mlp, bnbdeq)
             assert_same(a, A, _F(_C()), dt)
             assert_same(b, B, _F(_C()), dt)
             assert_same(c, C, _F(_C()), dt)
@@ -182,24 +202,30 @@ def your_dequantize_nf4(weight):
 
 if "TRITON_DEBUG" in os.environ:
     bsz, qlen, hd, m, seed, dt = (5,  777, 1, 128, 3408, torch.float16)
-    bsz, qlen, hd, m, seed, dt = (5,  777, 256, 128, 3410, torch.bfloat16)
+    # bsz, qlen, hd, m, seed, dt = (5,  777, 256, 128, 3410, torch.bfloat16)
+    #
+    # bsz, qlen, hd, m, seed, dt =   (5,  777, 128, 4, 3409, torch.float16)
 
     set_seed(seed)
-    torch.set_default_dtype(dt)
+    torch.set_default_dtype(torch.float32)
     mlp = MLP(hd = hd, m = m, dtype = dt).to("cuda")
-    X = torch.randn((bsz, qlen, hd), device = "cuda")
+    X = torch.randn((bsz, qlen, hd), device = "cuda", dtype = dt)
+    assert_correct_bnb(mlp.up_proj, dt)
+    assert_correct_bnb(mlp.gate_proj, dt)
+    assert_correct_bnb(mlp.down_proj, dt)
     torch.cuda.synchronize()
 
-    mlp.up_proj.weight.quant_state.state2.code = mlp.up_proj.weight.quant_state.state2.code.to(torch.float32)
-    torch.cuda.synchronize()
-    A = unsloth_dequantize(mlp.  up_proj); torch.cuda.synchronize()
-    a = your_dequantize_nf4(mlp.  up_proj); torch.cuda.synchronize()
+    a, b, c = mlp_dequantize(X, mlp, your_dequantize_nf4)
+    A, B, C = mlp_dequantize(X, mlp, bnbdeq)#unsloth_dequantize)
 
-    # the last 25 in every thing are wrong for some reason
-    print(A)
-    print(a)
+    fu = mlp_forward(X, mlp, your_dequantize_nf4)
+    ft = mlp_forward(X, mlp, bnbdeq)
+    assert_same(fu, ft, _F(_C()), dt)
 
-    assert_same(A, a)
+    assert_same(a, A, _F(_C()), dt)
+    assert_same(b, B, _F(_C()), dt)
+    assert_same(c, C, _F(_C()), dt)
+
     print("same!")
 else:
     print(test_dequantize(unsloth_dequantize) / test_dequantize(your_dequantize_nf4))
