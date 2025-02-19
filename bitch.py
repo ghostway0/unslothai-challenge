@@ -50,7 +50,7 @@ def bnb_Linear4bit(hd, m, dtype = torch.float16):
     )
 
 class MLP(nn.Module):
-    def __init__(self, hd = 4096, m = 14336, dtype = torch.float16):
+    def __init__(self, hd, m, dtype):
         super().__init__()
         self.gate_proj = bnb_Linear4bit(hd, m, dtype = dtype).to("cuda")
         self.up_proj   = bnb_Linear4bit(hd, m, dtype = dtype).to("cuda")
@@ -58,8 +58,12 @@ class MLP(nn.Module):
         self.gate_proj.weight.quant_state.dtype = dtype
         self.up_proj  .weight.quant_state.dtype = dtype
         self.down_proj.weight.quant_state.dtype = dtype
+        self.up_proj.weight.quant_state.state2.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.gate_proj.weight.quant_state.state2.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.down_proj.weight.quant_state.state2.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
         self.act_fn = ACT2FN["silu"]
     def forward(self, x):
+        print(self.up_proj(x))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 def mlp_forward(X, mlp, fx):
@@ -70,30 +74,29 @@ def mlp_forward(X, mlp, fx):
     return down
 
 def mlp_dequantize(X, mlp, fx):
-    mlp.up_proj.weight.quant_state.state2.code = mlp.up_proj.weight.quant_state.state2.code.to(torch.float32)
-    mlp.gate_proj.weight.quant_state.state2.code = mlp.gate_proj.weight.quant_state.state2.code.to(torch.float32)
-    mlp.down_proj.weight.quant_state.state2.code = mlp.down_proj.weight.quant_state.state2.code.to(torch.float32)
     a = fx(mlp.  up_proj).t(); torch.cuda.synchronize()
     b = fx(mlp.gate_proj).t(); torch.cuda.synchronize()
     c = fx(mlp.down_proj).t(); torch.cuda.synchronize()
     return a, b, c
 
 def test_dequantize(dequantize_fx):
+    print(f"test_dequantize {dequantize_fx.__name__}")
     elapsed = 0
     options = [
         # (5,  777, 128,  128, 3409, torch.bfloat16),
         # (5,  777, 128,  128, 3409, torch.float16),
-        # (5,  777, 128,  128, 3409, torch.float16),
+        (5,  777, 128,  128, 3409, torch.float16),
         # (5,  777, 5, 128, 3408, torch.float16),
         # (5,  777, 128,  128, 3408, torch.float32),
-        (3, 2048, 14336, 14336, 3408, torch.bfloat16),
-        (2, 3333, 2048,  8192, 3407, torch.float16),
+        # (3, 2048, 14336, 14336, 3408, torch.bfloat16),
+        # (2, 3333, 2048,  8192, 3407, torch.float16),
     ]
-    for (bsz, qlen, hd, m, seed, dt) in options:
+    for i, (bsz, qlen, hd, m, seed, dt) in enumerate(options):
+        print(options[i])
         set_seed(seed)
-        torch.set_default_dtype(dt)
+        torch.set_default_dtype(torch.float32)
         mlp = MLP(hd = hd, m = m, dtype = dt).to("cuda")
-        X = torch.randn((bsz, qlen, hd), device = "cuda")
+        X = torch.randn((bsz, qlen, hd), device = "cuda", dtype = dt)
         torch.cuda.synchronize()
 
         # Warmup
@@ -154,7 +157,7 @@ def _your_dequantize_nf4_kernel(
     tl.store(out_ptr + even_offsets, val1, mask=even_offsets < n_elements)
 
 # TILE_SIZE 1024
-def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 128):
+def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 512):
     output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device, requires_grad = False).cuda()
 
     grid = (triton.cdiv(output.numel() // 2 + TILE_SIZE - 1, TILE_SIZE),)
@@ -172,7 +175,6 @@ def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 128):
         quant_state.offset.item(),
         lookup.to(output.dtype),
     )
-
     return output.t() if weight.shape[0] == 1 else output
 
 def your_dequantize_nf4(weight):
