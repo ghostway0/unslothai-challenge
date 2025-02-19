@@ -54,7 +54,7 @@ def assert_same(x, y, line=0, dtype=None):
         print(f"{x=}")
         print(f"{y=}")
         print(
-            f"Failed allclose: {NAME(x)}, {NAME(y)}\n{str(error)}"
+            f"Failed allclose({line}): {NAME(x)}, {NAME(y)}\n{str(error)}"
         )
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -79,9 +79,12 @@ class MLP(nn.Module):
         self.gate_proj.weight.quant_state.dtype = dtype
         self.up_proj  .weight.quant_state.dtype = dtype
         self.down_proj.weight.quant_state.dtype = dtype
-        # self.up_proj.weight.quant_state.state2.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
-        # self.gate_proj.weight.quant_state.state2.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
-        # self.down_proj.weight.quant_state.state2.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.up_proj.weight.quant_state.state2.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.gate_proj.weight.quant_state.state2.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.down_proj.weight.quant_state.state2.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.up_proj.weight.quant_state.code = self.up_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.gate_proj.weight.quant_state.code = self.gate_proj.weight.quant_state.state2.code.to(torch.float32)
+        self.down_proj.weight.quant_state.code = self.down_proj.weight.quant_state.state2.code.to(torch.float32)
         self.act_fn = ACT2FN["silu"]
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -123,6 +126,7 @@ def test_dequantize(dequantize_fx):
         (3, 2048, 14336, 14336, 3408, torch.bfloat16),
         (3, 2048, 14336, 14336, 3408, torch.float16),
         (2, 3333, 2048,  8192, 3407, torch.float16),
+        (2, 3333, 2048,  8192, 3407, torch.bfloat16),
     ]
     for i, (bsz, qlen, hd, m, seed, dt) in enumerate(options):
         print(options[i])
@@ -193,15 +197,15 @@ def _your_dequantize_nf4_kernel(
     tl.store(out_ptr + even_offsets, val1, mask=even_offsets < n_elements)
 
 # TILE_SIZE 1024
-def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 512):
+def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 1024):
     output = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=weight.device, requires_grad = False).cuda()
 
     grid = (triton.cdiv(output.numel() // 2 + TILE_SIZE - 1, TILE_SIZE),)
     _your_dequantize_nf4_kernel[grid](
-        quant_state.state2.code.to(output.dtype),
+        quant_state.state2.code,
         weight,
         quant_state.absmax,
-        quant_state.state2.absmax.to(output.dtype),
+        quant_state.state2.absmax,
         output,
         quant_state.blocksize // 2,
         output.numel(),
@@ -209,15 +213,17 @@ def _your_dequantize_nf4(weight, quant_state, TILE_SIZE = 512):
         quant_state.state2.blocksize,
         quant_state.absmax.numel(),
         quant_state.offset.item(),
-        lookup.to(output.dtype),
+        lookup,
     )
     return output.t() if weight.shape[0] == 1 else output
 
 def your_dequantize_nf4(weight):
     return _your_dequantize_nf4(weight.weight.data, weight.weight.quant_state)
 
-if "TRITON_DEBUG" in os.environ:
-    bsz, qlen, hd, m, seed, dt = (5,  777, 1, 128, 3408, torch.float16)
+if "DEBUG" in os.environ:
+    bsz, qlen, hd, m, seed, dt = (2,  3333, 128, 128, 3407, torch.float16)
+    # bsz, qlen, hd, m, seed, dt = (3, 2048, 14336, 14336, 3408, torch.float16)
+    # bsz, qlen, hd, m, seed, dt =    (2, 3333, 2048,  8192, 3407, torch.float16)
     # bsz, qlen, hd, m, seed, dt = (5,  777, 256, 128, 3410, torch.bfloat16)
     #
     # bsz, qlen, hd, m, seed, dt =   (5,  777, 128, 4, 3409, torch.float16)
@@ -232,7 +238,7 @@ if "TRITON_DEBUG" in os.environ:
     torch.cuda.synchronize()
 
     a, b, c = mlp_dequantize(X, mlp, your_dequantize_nf4)
-    A, B, C = mlp_dequantize(X, mlp, bnbdeq)#unsloth_dequantize)
+    A, B, C = mlp_dequantize(X, mlp, bnbdeq)
 
     fu = mlp_forward(X, mlp, your_dequantize_nf4)
     ft = mlp_forward(X, mlp, bnbdeq)
@@ -241,7 +247,5 @@ if "TRITON_DEBUG" in os.environ:
     assert_same(a, A, _F(_C()), dt)
     assert_same(b, B, _F(_C()), dt)
     assert_same(c, C, _F(_C()), dt)
-
-    print("same!")
 else:
     print(test_dequantize(unsloth_dequantize) / test_dequantize(your_dequantize_nf4))
