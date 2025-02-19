@@ -84,10 +84,10 @@ def test_dequantize(dequantize_fx):
         # (5,  777, 128,  128, 3409, torch.bfloat16),
         # (5,  777, 128,  128, 3409, torch.float16),
         # (5,  777, 128,  128, 3409, torch.float16),
-        (5,  777, 5, 128, 3408, torch.float16),
+        # (5,  777, 5, 128, 3408, torch.float16),
         # (5,  777, 128,  128, 3408, torch.float32),
-        # (3, 2048, 14336, 14336, 3408, torch.bfloat16),
-        # (2, 3333, 2048,  8192, 3407, torch.float16),
+        (3, 2048, 14336, 14336, 3408, torch.bfloat16),
+        (2, 3333, 2048,  8192, 3407, torch.float16),
     ]
     for (bsz, qlen, hd, m, seed, dt) in options:
         set_seed(seed)
@@ -98,7 +98,7 @@ def test_dequantize(dequantize_fx):
 
         # Warmup
         for _ in range(2):
-            # assert_same( mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
+            assert_same( mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
             a, b, c = mlp_dequantize(X, mlp, dequantize_fx)
             A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
             assert_same(a, A, _F(_C()), dt)
@@ -180,7 +180,7 @@ def your_dequantize_nf4(weight):
 
 if "TRITON_DEBUG" in os.environ:
     bsz, qlen, hd, m, seed, dt = (5,  777, 1, 128, 3408, torch.float16)
-    # bsz, qlen, hd, m, seed, dt = (5,  777, 1, 128, 3410, torch.bfloat16)
+    bsz, qlen, hd, m, seed, dt = (5,  777, 256, 128, 3410, torch.bfloat16)
 
     set_seed(seed)
     torch.set_default_dtype(dt)
